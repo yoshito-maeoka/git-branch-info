@@ -1,0 +1,345 @@
+#!/bin/bash
+# git-branch-info: Extended git branch with created date, last modified, and merge status
+# Usage: git-branch-info [--remote|-r] [-s name|created|modified|merged] [asc|desc]
+# Compatible with bash 3.2+ (macOS default)
+
+set -uo pipefail
+
+# Colors (disabled when piping to avoid escape codes in output)
+if [ -t 1 ]; then
+    RESET='\033[0m'
+    BOLD='\033[1m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+    RED='\033[31m'
+    CYAN='\033[36m'
+    MAGENTA='\033[35m'
+    DIM='\033[2m'
+else
+    RESET=''
+    BOLD=''
+    GREEN=''
+    YELLOW=''
+    RED=''
+    CYAN=''
+    MAGENTA=''
+    DIM=''
+fi
+
+# Defaults
+REMOTE=false
+SORT_KEY="name"
+SORT_DIR="asc"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --remote|-r)
+            REMOTE=true
+            shift
+            ;;
+        -s|--sort)
+            if [[ -n "${2:-}" ]]; then
+                case "$2" in
+                    name|created|modified|merged)
+                        SORT_KEY="$2"
+                        shift 2
+                        ;;
+                    *)
+                        echo "Error: Invalid sort key '$2'. Use: name, created, modified, merged" >&2
+                        exit 1
+                        ;;
+                esac
+            else
+                echo "Error: -s requires a column name (name|created|modified|merged)" >&2
+                exit 1
+            fi
+            ;;
+        asc)
+            SORT_DIR="asc"
+            shift
+            ;;
+        desc|dsc)
+            SORT_DIR="desc"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: git-branch-info [OPTIONS] [asc|desc]"
+            echo ""
+            echo "Extended git branch with created date, last modified, and merge status."
+            echo ""
+            echo "Options:"
+            echo "  --remote, -r           Show remote branches"
+            echo "  -s, --sort COLUMN      Sort by column: name (default), created, modified, merged"
+            echo "  asc                    Sort ascending (default)"
+            echo "  desc, dsc              Sort descending"
+            echo "  -h, --help             Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  git-branch-info                      # local branches, sorted by name asc"
+            echo "  git-branch-info -s modified desc      # sort by last modified, newest first"
+            echo "  git-branch-info --remote -s created   # remote branches, sorted by created asc"
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option '$1'. Use -h for help." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Temp files for lookup tables (bash 3.2 compatible — no associative arrays)
+TMPDIR_WORK=$(mktemp -d)
+# Only clean up in the main shell ($$), not in background subshells
+MAIN_PID=$$
+trap '[ $$ -eq $MAIN_PID ] && rm -rf "$TMPDIR_WORK"' EXIT
+
+MERGED_FILE="$TMPDIR_WORK/merged"
+CREATED_FILE="$TMPDIR_WORK/created"
+DATAFILE="$TMPDIR_WORK/data"
+
+touch "$MERGED_FILE" "$CREATED_FILE" "$DATAFILE"
+
+# Determine main branch
+MAIN_BRANCH=""
+for candidate in main master; do
+    if git rev-parse --verify "$candidate" &>/dev/null; then
+        MAIN_BRANCH="$candidate"
+        break
+    fi
+done
+
+# Get current branch and its upstream remote tracking branch
+CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+UPSTREAM_BRANCH=$(git rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null || echo "")
+
+# Determine ref prefix and fetch branch data first (needed for dynamic column width)
+if $REMOTE; then
+    git fetch --quiet 2>/dev/null || true
+    REF_PREFIX="refs/remotes/"
+else
+    REF_PREFIX="refs/heads/"
+fi
+
+# ── BATCH 1: branch name + last modified (single git call) ──
+BRANCH_DATA=$(git for-each-ref --format='%(refname:short)	%(committerdate:iso)' "$REF_PREFIX" | grep -v '/HEAD$' || true)
+
+if [[ -z "$BRANCH_DATA" ]]; then
+    exit 0
+fi
+
+# ── Column widths ──
+# Fixed columns
+COL_CREATED=19
+COL_MODIFIED=19
+COL_MERGED=10
+FIXED_WIDTH=$((COL_CREATED + COL_MODIFIED + COL_MERGED))
+
+# Calculate max branch name length from actual data
+MAX_BRANCH_LEN=6  # minimum: "Branch" header length
+while IFS=$'\t' read -r branch _rest; do
+    [[ -z "$branch" ]] && continue
+    len=${#branch}
+    [[ $len -gt $MAX_BRANCH_LEN ]] && MAX_BRANCH_LEN=$len
+done <<< "$BRANCH_DATA"
+
+# Branch column = max name length + 2 (for "* " prefix) + 2 (padding)
+COL_BRANCH=$((MAX_BRANCH_LEN + 4))
+# Minimum branch column width
+[[ $COL_BRANCH -lt 20 ]] && COL_BRANCH=20
+
+# Auto-detect terminal width for max constraint
+TTY_WIDTH=0
+# stty size via /dev/tty — outputs "rows cols", portable across Linux/macOS
+TTY_WIDTH=$( (stty size < /dev/tty) 2>/dev/null | cut -d' ' -f2 || echo 0)
+if [[ "$TTY_WIDTH" -le 0 ]] 2>/dev/null; then
+    TTY_WIDTH=$(tput cols 2>/dev/null || echo 0)
+fi
+if [[ "$TTY_WIDTH" -le 0 ]] 2>/dev/null; then
+    TTY_WIDTH="${COLUMNS:-0}"
+fi
+if [[ "$TTY_WIDTH" -le 0 ]] 2>/dev/null; then
+    TTY_WIDTH=120
+fi
+
+# Cap branch column to fit within terminal width
+MAX_BRANCH_COL=$((TTY_WIDTH - FIXED_WIDTH))
+[[ $COL_BRANCH -gt $MAX_BRANCH_COL ]] && COL_BRANCH=$MAX_BRANCH_COL
+
+# Inner width (minus 2 for prefix "* " or "  ")
+COL_BRANCH_INNER=$((COL_BRANCH - 2))
+
+# Header
+printf "${BOLD}%-${COL_BRANCH}s %-${COL_CREATED}s %-${COL_MODIFIED}s %-${COL_MERGED}s${RESET}\n" "Branch" "Created" "Last Modified" "Merged"
+
+# Create separators with exact column width (no printf width specifier - ─ is multi-byte)
+SEP_BRANCH=$(printf '%*s' "$COL_BRANCH" '' | tr ' ' '─')
+SEP_CREATED=$(printf '%*s' "$COL_CREATED" '' | tr ' ' '─')
+SEP_MODIFIED=$(printf '%*s' "$COL_MODIFIED" '' | tr ' ' '─')
+SEP_MERGED=$(printf '%*s' "$COL_MERGED" '' | tr ' ' '─')
+printf "%s %s %s %s\n" "$SEP_BRANCH" "$SEP_CREATED" "$SEP_MODIFIED" "$SEP_MERGED"
+
+# ── BATCH 2: merged branches (single git call) ──
+if [[ -n "$MAIN_BRANCH" ]]; then
+    if $REMOTE; then
+        REMOTE_MAIN=""
+        while IFS= read -r ref; do
+            case "$ref" in */"$MAIN_BRANCH") REMOTE_MAIN="$ref"; break ;; esac
+        done <<< "$(git for-each-ref --format='%(refname:short)' refs/remotes/)"
+        MERGE_TARGET="${REMOTE_MAIN:-$MAIN_BRANCH}"
+    else
+        MERGE_TARGET="$MAIN_BRANCH"
+    fi
+
+    if $REMOTE; then
+        git branch -r --merged "$MERGE_TARGET" 2>/dev/null | sed 's/^[* ]*//' > "$MERGED_FILE"
+    else
+        git branch --merged "$MERGE_TARGET" 2>/dev/null | sed 's/^[* ]*//' > "$MERGED_FILE"
+    fi
+fi
+
+# ── BATCH 3: created dates — parallel merge-base per branch ──
+# Each background subshell writes directly to CREATED_FILE (append is atomic for short lines)
+if [[ -n "$MAIN_BRANCH" ]]; then
+    while IFS=$'\t' read -r branch _rest; do
+        [[ -z "$branch" ]] && continue
+        # Skip main branch itself
+        [[ "$branch" == "$MAIN_BRANCH" ]] && continue
+        if $REMOTE; then
+            remote_name="${branch%%/*}"
+            [[ "$branch" == "${remote_name}/${MAIN_BRANCH}" ]] && continue
+        fi
+
+        # Run each merge-base lookup in parallel background job
+        (
+            base_ref="$MAIN_BRANCH"
+            if $REMOTE; then
+                remote_name="${branch%%/*}"
+                if git rev-parse --verify "${remote_name}/${MAIN_BRANCH}" &>/dev/null; then
+                    base_ref="${remote_name}/${MAIN_BRANCH}"
+                fi
+            fi
+            merge_base=$(git merge-base "$base_ref" "$branch" 2>/dev/null || true)
+            if [[ -n "$merge_base" ]]; then
+                # Use sed -n '1p' instead of head -1 to avoid SIGPIPE
+                first_commit=$(git rev-list --reverse "${merge_base}..${branch}" 2>/dev/null | sed -n '1p')
+                if [[ -n "$first_commit" ]]; then
+                    created=$(git log -1 --format='%ci' "$first_commit" 2>/dev/null || true)
+                else
+                    created=$(git log -1 --format='%ci' "$branch" 2>/dev/null || true)
+                fi
+            else
+                created=$(git log -1 --format='%ci' "$branch" 2>/dev/null || true)
+            fi
+            printf '%s\t%s\n' "$branch" "${created:-unknown}" >> "$CREATED_FILE"
+        ) &
+    done <<< "$BRANCH_DATA"
+    wait
+fi
+
+# ── Lookup helpers (grep-based, bash 3.2 compatible) ──
+lookup_created() {
+    local branch="$1"
+    local result
+    result=$(grep -m1 "^${branch}	" "$CREATED_FILE" 2>/dev/null | cut -f2 || true)
+    echo "${result:-}"
+}
+
+is_merged() {
+    local branch="$1"
+    grep -qxF "$branch" "$MERGED_FILE" 2>/dev/null
+}
+
+# ── Build output data ──
+while IFS=$'\t' read -r branch modified_full; do
+    [[ -z "$branch" ]] && continue
+
+    # Is current branch? (local: current branch, remote: upstream of current branch)
+    is_current="0"
+    if ! $REMOTE && [[ "$branch" == "$CURRENT_BRANCH" ]]; then
+        is_current="1"
+    elif $REMOTE && [[ -n "$UPSTREAM_BRANCH" && "$branch" == "$UPSTREAM_BRANCH" ]]; then
+        is_current="1"
+    fi
+
+    # Last modified (trim to YYYY-MM-DD HH:MM)
+    modified="${modified_full:0:16}"
+
+    # Created date
+    created=$(lookup_created "$branch")
+    if [[ -z "$created" ]]; then
+        # Main branch or fallback: use earliest commit
+        created=$(git log --reverse --format='%ci' "$branch" 2>/dev/null | sed -n '1p' || true)
+    fi
+    created="${created:0:16}"
+
+    # Merge status
+    merged_raw="n/a"
+    if [[ -n "$MAIN_BRANCH" ]]; then
+        is_main=false
+        if [[ "$branch" == "$MAIN_BRANCH" ]]; then
+            is_main=true
+        elif $REMOTE; then
+            remote_name="${branch%%/*}"
+            [[ "$branch" == "${remote_name}/${MAIN_BRANCH}" ]] && is_main=true
+        fi
+
+        if ! $is_main; then
+            if is_merged "$branch"; then
+                merged_raw="yes"
+            else
+                merged_raw="no"
+            fi
+        fi
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$branch" "$is_current" "${created:-unknown}" "${modified:-unknown}" "$merged_raw" \
+        >> "$DATAFILE"
+
+done <<< "$BRANCH_DATA"
+
+# ── Sort ──
+# Columns: 1=name, 2=is_current, 3=created, 4=modified, 5=merged
+case "$SORT_KEY" in
+    name)     SORT_COL=1 ;;
+    created)  SORT_COL=3 ;;
+    modified) SORT_COL=4 ;;
+    merged)   SORT_COL=5 ;;
+esac
+
+SORT_REVERSE=""
+[[ "$SORT_DIR" == "desc" ]] && SORT_REVERSE="-r"
+
+SORTED=$(sort -t'	' -k${SORT_COL},${SORT_COL} $SORT_REVERSE "$DATAFILE")
+
+# ── Render ──
+while IFS=$'\t' read -r display_name is_current created modified merged_raw; do
+    [[ -z "$display_name" ]] && continue
+
+    prefix="  "
+    name_color=""
+    if [[ "$is_current" == "1" ]]; then
+        prefix="* "
+        name_color="$GREEN$BOLD"
+    elif $REMOTE; then
+        name_color="$RED"
+    else
+        name_color="$GREEN"
+    fi
+
+    case "$merged_raw" in
+        yes)  merged="${CYAN}yes${RESET}" ;;
+        no)   merged="${YELLOW}no${RESET}" ;;
+        *)    merged="${DIM}-${RESET}" ;;
+    esac
+
+    # Truncate branch name if too long
+    if [[ ${#display_name} -gt $COL_BRANCH_INNER ]]; then
+        display_name="${display_name:0:$((COL_BRANCH_INNER - 1))}…"
+    fi
+
+    printf "${prefix}${name_color}%-${COL_BRANCH_INNER}s${RESET} ${MAGENTA}%-${COL_CREATED}s${RESET} ${YELLOW}%-${COL_MODIFIED}s${RESET} %-${COL_MERGED}b\n" \
+        "$display_name" "$created" "$modified" "$merged"
+
+done <<< "$SORTED"
