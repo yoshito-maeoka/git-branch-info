@@ -17,7 +17,7 @@ Branch                    Created             Last Modified       Merged
 
 ```bash
 # Clone or download the script
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/git-branch-info/main/git-branch-info
+curl -O https://raw.githubusercontent.com/yoshito-maeoka/git-branch-info/main/git-branch-info
 chmod +x git-branch-info
 
 # Option 1: Add to PATH
