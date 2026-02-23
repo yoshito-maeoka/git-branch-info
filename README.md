@@ -1,6 +1,7 @@
 # git-branch-info
 
 Extended `git branch` that shows created date, last modified date, and merge status for each branch.
+powered by claude code
 
 ## Example Output
 
