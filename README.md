@@ -1,7 +1,9 @@
 # git-branch-info
 
+  [![Built with Claude Code](https://img.shields.io/badge/Built%20with-Claude%20Code-blueviolet)](https://claude.ai/code)                             
+
 Extended `git branch` that shows created date, last modified date, and merge status for each branch.
-powered by claude code
+
 
 ## Example Output
 
